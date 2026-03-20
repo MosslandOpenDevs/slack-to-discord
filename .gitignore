@@ -1,0 +1,9 @@
+node_modules/
+src/transform.ts
+dist/
+.env
+*.js.map
+bridge.log
+*.log
+last_ts.json
+slack2discord.service
