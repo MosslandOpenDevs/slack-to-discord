@@ -13,7 +13,7 @@
  *   cp examples/transform.attendance.ts src/transform.ts
  */
 
-import type { TransformContext, DiscordPayload } from "../src/types.js";
+import type { TransformContext, DiscordPayload } from "../src/types";
 
 export function transform(ctx: TransformContext): DiscordPayload | null {
   const { event, payload } = ctx;

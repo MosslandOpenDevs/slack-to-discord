@@ -1,11 +1,12 @@
 import "dotenv/config";
-// import * as fs from "fs";
-// import * as path from "path";
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
-import type { SlackMessageEvent, DiscordPayload } from "./types.js";
-import { transform } from "./transform.js";
-import { convertMarkdown } from "./convert.js";
+import type { SlackMessageEvent } from "./types";
+import { transform } from "./transform";
+import { messageBody } from "./convert";
+import { buildDefaultPayload, isEmptyPayload } from "./payload";
+
+const iso = () => new Date().toISOString();
 
 // ── Environment variable validation ───────────────────────────
 const SLACK_APP_TOKEN = process.env.SLACK_APP_TOKEN;
@@ -58,6 +59,7 @@ let ownBotUserId: string | null = null;
 // ── TTL cache ─────────────────────────────────────────────────
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const CACHE_NEG_TTL_MS = 60 * 1000;
+const CACHE_MAX_SIZE = 5000; // hard cap so a busy workspace can't grow the map unbounded
 
 interface CacheEntry { value: string; expiresAt: number; }
 
@@ -72,6 +74,11 @@ function cacheGet(cache: Map<string, CacheEntry>, key: string): string | undefin
 }
 
 function cacheSet(cache: Map<string, CacheEntry>, key: string, value: string, ttl: number): void {
+  if (cache.size >= CACHE_MAX_SIZE && !cache.has(key)) {
+    // Evict the oldest entry (Map preserves insertion order).
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
   cache.set(key, { value, expiresAt: Date.now() + ttl });
 }
 
@@ -104,25 +111,30 @@ async function getUserName(userId: string): Promise<string> {
   }
 }
 
-// ── Last-processed timestamp persistence (disabled) ───────────
-// const LAST_TS_FILE = path.join(process.cwd(), "last_ts.json");
-//
-// function readLastTs(): Record<string, string> {
-//   try { return JSON.parse(fs.readFileSync(LAST_TS_FILE, "utf-8")); }
-//   catch { return {}; }
-// }
-//
-// function writeLastTs(channelId: string, ts: string): void {
-//   const data = readLastTs();
-//   data[channelId] = ts;
-//   fs.writeFileSync(LAST_TS_FILE, JSON.stringify(data, null, 2), "utf-8");
-// }
+/** Resolve bare <@U…> / <#C…> tokens (no inline label) to @name / #name. */
+async function resolveMentions(text: string): Promise<string> {
+  if (!text.includes("<@") && !text.includes("<#")) return text;
+
+  const userIds = new Set<string>();
+  const channelIds = new Set<string>();
+  for (const m of text.matchAll(/<@([A-Z0-9]+)>/g)) userIds.add(m[1]);
+  for (const m of text.matchAll(/<#([A-Z0-9]+)>/g)) channelIds.add(m[1]);
+
+  const [users, channels] = await Promise.all([
+    Promise.all([...userIds].map(async (id) => [id, await getUserName(id)] as const)),
+    Promise.all([...channelIds].map(async (id) => [id, await getChannelName(id)] as const)),
+  ]);
+  const userMap = new Map(users);
+  const channelMap = new Map(channels);
+
+  return text
+    .replace(/<@([A-Z0-9]+)>/g, (_, id) => `@${userMap.get(id) ?? id}`)
+    .replace(/<#([A-Z0-9]+)>/g, (_, id) => `#${channelMap.get(id) ?? id}`);
+}
 
 // ── Send to Discord webhook (with rate-limit retry) ───────────
 const FETCH_TIMEOUT_MS = 10_000;
-const MAX_DISCORD_USERNAME_LEN = 80;
-const MAX_DISCORD_CONTENT_LEN = 2000;
-const MAX_DISCORD_EMBEDS = 10;
+const MAX_RATE_LIMIT_RETRIES = 3;
 
 async function sendToDiscord(payload: object, attempt = 0): Promise<void> {
   const res = await fetch(DISCORD_WEBHOOK_URL!, {
@@ -132,7 +144,7 @@ async function sendToDiscord(payload: object, attempt = 0): Promise<void> {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
-  if (res.status === 429 && attempt < 3) {
+  if (res.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
     let retryAfterMs = 1000;
     try {
       const json = await res.json() as { retry_after?: number };
@@ -148,7 +160,7 @@ async function sendToDiscord(payload: object, attempt = 0): Promise<void> {
   }
 }
 
-// ── Core: process one message and send to Discord ─────────────
+// ── Filtering ─────────────────────────────────────────────────
 function shouldSkip(event: SlackMessageEvent): boolean {
   if (event.subtype && ["message_changed", "message_deleted", "channel_join"].includes(event.subtype)) return true;
   if (event.bot_id || event.subtype === "bot_message") {
@@ -160,8 +172,8 @@ function shouldSkip(event: SlackMessageEvent): boolean {
   return false;
 }
 
+// ── Core: process one message and send to Discord ─────────────
 async function processMessage(event: SlackMessageEvent, channelId: string): Promise<boolean> {
-  const text = (event.text ?? "").trim();
   const userId = event.user;
 
   const [channelName, resolvedName] = await Promise.all([
@@ -169,116 +181,76 @@ async function processMessage(event: SlackMessageEvent, channelId: string): Prom
     userId ? getUserName(userId) : Promise.resolve(null),
   ]);
 
-  const rawUserName = event.username ?? resolvedName ?? "Unknown";
-  const userName = rawUserName.slice(0, MAX_DISCORD_USERNAME_LEN) || "Unknown";
-  const convertedText = convertMarkdown(text);
+  const userName = event.username ?? resolvedName ?? "Unknown";
+  const bodyText = await resolveMentions(messageBody(event));
 
-  const embeds: DiscordPayload["embeds"] = [];
-
-  if (convertedText) {
-    const tsNum = parseFloat(event.ts ?? "");
-    const timestamp = Number.isFinite(tsNum) ? new Date(tsNum * 1000).toISOString() : new Date().toISOString();
-    embeds.push({
-      description: convertedText.length > 4096 ? convertedText.slice(0, 4093) + "..." : convertedText,
-      color: 0x4a154b,
-      footer: { text: `#${channelName}` },
-      timestamp,
-    });
-  }
-
-  for (const att of event.attachments ?? []) {
-    if (embeds.length >= MAX_DISCORD_EMBEDS) break;
-    const attText = att.text || att.fallback || "";
-    const embed: import("./types.js").DiscordEmbed = { color: 0x888888 };
-    if (att.title) embed.title = att.title_link ? `[${att.title}](${att.title_link})` : att.title;
-    if (attText) embed.description = attText.length > 4096 ? attText.slice(0, 4093) + "..." : attText;
-    embeds.push(embed);
-  }
-
-  const fileLines = (event.files ?? []).map((f) => {
-    const url = f.is_public && f.permalink_public ? f.permalink_public : null;
-    const label = f.name ?? "file";
-    return url ? `[${label}](${url})` : `${label} *(private)*`;
+  const defaultPayload = buildDefaultPayload({
+    event,
+    userName,
+    channelName,
+    bodyText,
+    discordUsername: DISCORD_USERNAME,
   });
-  const rawContent = `📎 Attachments:\n${fileLines.join("\n")}`;
 
-  const defaultPayload: DiscordPayload = {
-    username: DISCORD_USERNAME ?? userName,
-    embeds,
-    ...(fileLines.length > 0 && {
-      content: rawContent.length > MAX_DISCORD_CONTENT_LEN
-        ? rawContent.slice(0, MAX_DISCORD_CONTENT_LEN - 3) + "..."
-        : rawContent,
-    }),
-  };
-
-  const finalPayload = transform({ event, channelName, userName, text: convertedText, payload: defaultPayload });
+  const finalPayload = transform({ event, channelName, userName, text: bodyText, payload: defaultPayload });
   if (finalPayload === null) return false; // dropped by transform
+
+  if (isEmptyPayload(finalPayload)) {
+    console.warn(`[${iso()}] ⚠️  Skipped empty payload for #${channelName}`);
+    return false;
+  }
 
   await sendToDiscord(finalPayload);
 
   const logMsg = DEBUG_LOG_CONTENT
-    ? `#${channelName} → Discord | ${userName}: ${text.slice(0, 60)}`
+    ? `#${channelName} → Discord | ${userName}: ${bodyText.slice(0, 60)}`
     : `#${channelName} → Discord | ${userName}`;
-  console.log(`[${new Date().toISOString()}] ✅ ${logMsg}`);
+  console.log(`[${iso()}] ✅ ${logMsg}`);
   return true;
 }
 
-// ── Catch-up: send missed messages since last processed ts ────
-async function catchUp(channelId: string, sinceTs: string): Promise<void> {
-  console.log(`⏪ Catching up #${channelId} since ts=${sinceTs}...`);
+// ── Per-channel serial queue ──────────────────────────────────
+// Messages within one channel are forwarded strictly in order; different
+// channels proceed in parallel. Node's EventEmitter does not await async
+// listeners, so without this a slow send could reorder a channel's messages.
+const channelQueues = new Map<string, Promise<void>>();
+let inFlight = 0;
+let shuttingDown = false;
+let drainResolve: (() => void) | null = null;
 
-  const history = await webClient.conversations.history({
-    channel: channelId,
-    oldest: sinceTs,
-    inclusive: false, // exclude the already-processed message
-    limit: 200,
+function enqueue(channelId: string, task: () => Promise<void>): void {
+  inFlight++;
+  const prev = channelQueues.get(channelId) ?? Promise.resolve();
+  const next = prev.then(task, task).finally(() => {
+    inFlight--;
+    if (channelQueues.get(channelId) === next) channelQueues.delete(channelId);
+    if (inFlight === 0 && drainResolve) drainResolve();
   });
-
-  const missed = ((history.messages ?? []) as SlackMessageEvent[]).reverse(); // oldest first
-
-  if (missed.length === 0) {
-    console.log("✅ No missed messages.");
-    return;
-  }
-
-  console.log(`📬 ${missed.length} missed message(s) — forwarding...`);
-
-  for (const event of missed) {
-    if (shouldSkip(event)) continue;
-    try {
-      await processMessage(event, channelId);
-      // if (sent && event.ts) writeLastTs(channelId, event.ts);
-    } catch (err) {
-      console.error(`[${new Date().toISOString()}] ❌ Catch-up send failed:`, err);
-    }
-  }
+  channelQueues.set(channelId, next);
 }
 
 // ── Message event handler ─────────────────────────────────────
-let inFlightCount = 0;
-let shutdownResolve: (() => void) | null = null;
-
 socketClient.on("message", async ({ event, ack }: { event: SlackMessageEvent; ack: () => Promise<void> }) => {
-  await ack();
+  try {
+    await ack();
+  } catch (err) {
+    console.error(`[${iso()}] ⚠️  ack() failed:`, err);
+  }
 
+  if (shuttingDown) return;
   if (shouldSkip(event)) return;
 
   const channelId = event.channel;
   if (!channelId) return;
-
   if (CHANNEL_ALLOWLIST.length > 0 && !CHANNEL_ALLOWLIST.includes(channelId)) return;
 
-  inFlightCount++;
-  try {
-    await processMessage(event, channelId);
-    // if (sent && event.ts) writeLastTs(channelId, event.ts);
-  } catch (err) {
-    console.error(`[${new Date().toISOString()}] ❌ Failed to send:`, err);
-  } finally {
-    inFlightCount--;
-    if (inFlightCount === 0 && shutdownResolve) shutdownResolve();
-  }
+  enqueue(channelId, async () => {
+    try {
+      await processMessage(event, channelId);
+    } catch (err) {
+      console.error(`[${iso()}] ❌ Failed to send:`, err);
+    }
+  });
 });
 
 // ── Start ─────────────────────────────────────────────────────
@@ -304,16 +276,6 @@ async function main() {
     console.log("🤖 All bot messages blocked (SLACK_BOT_ALLOWLIST not set)");
   }
 
-  // ── Catch-up missed messages (disabled) ───────────────────
-  // const lastTs = readLastTs();
-  // for (const channelId of CHANNEL_ALLOWLIST) {
-  //   if (lastTs[channelId]) {
-  //     await catchUp(channelId, lastTs[channelId]);
-  //   } else {
-  //     console.log(`ℹ️  No last_ts for ${channelId} — skipping catch-up (first run)`);
-  //   }
-  // }
-
   await socketClient.start();
   console.log("✅ Connected to Slack via Socket Mode. Waiting for messages...");
 }
@@ -324,14 +286,18 @@ main().catch((err) => {
 });
 
 // ── Graceful shutdown ─────────────────────────────────────────
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
 async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.log(`${signal} received — shutting down...`);
 
-  if (inFlightCount > 0) {
-    console.log(`⏳ Waiting for ${inFlightCount} in-flight request(s)...`);
+  if (inFlight > 0) {
+    console.log(`⏳ Waiting for ${inFlight} in-flight message(s)...`);
     await Promise.race([
-      new Promise<void>((resolve) => { shutdownResolve = resolve; }),
-      new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+      new Promise<void>((resolve) => { drainResolve = resolve; }),
+      new Promise<void>((resolve) => setTimeout(resolve, SHUTDOWN_TIMEOUT_MS)),
     ]);
   }
 
@@ -342,3 +308,13 @@ async function shutdown(signal: string): Promise<void> {
 
 process.on("SIGTERM", () => { void shutdown("SIGTERM"); });
 process.on("SIGINT",  () => { void shutdown("SIGINT"); });
+
+// ── Last-resort safety nets ───────────────────────────────────
+// A single bad message must never take the whole bridge down silently.
+process.on("unhandledRejection", (reason) => {
+  console.error(`[${iso()}] ⚠️  Unhandled promise rejection:`, reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error(`[${iso()}] ❌ Uncaught exception:`, err);
+  process.exit(1); // exit non-zero so systemd's Restart=on-failure brings us back
+});

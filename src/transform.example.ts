@@ -16,13 +16,13 @@
  *   ctx.event        — raw Slack message event (text, blocks, attachments, files, ...)
  *   ctx.channelName  — resolved Slack channel name  (e.g. "general")
  *   ctx.userName     — resolved sender display name
- *   ctx.text         — Slack mrkdwn converted to Discord markdown (event.text fallback)
+ *   ctx.text         — message body as Discord markdown (mrkdwn or Block Kit fallback, mentions resolved)
  *   ctx.payload      — default Discord payload built by the bridge
  *
  * See examples/ for real-world use cases.
  */
 
-import type { TransformContext, DiscordPayload } from "./types.js";
+import type { TransformContext, DiscordPayload } from "./types";
 
 export function transform(ctx: TransformContext): DiscordPayload | null {
   // Default: forward the message as-is

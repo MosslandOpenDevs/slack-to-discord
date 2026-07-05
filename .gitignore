@@ -3,7 +3,8 @@ src/transform.ts
 dist/
 .env
 *.js.map
-bridge.log
 *.log
 last_ts.json
+
+# Your customized systemd unit (copy of slack2discord.service.example)
 slack2discord.service

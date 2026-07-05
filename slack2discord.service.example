@@ -1,0 +1,34 @@
+# slack2discord systemd unit — template
+#
+# 1. Copy it:      cp slack2discord.service.example slack2discord.service
+# 2. Edit User / WorkingDirectory / ExecStart below to match your server.
+# 3. Install:      sudo cp slack2discord.service /etc/systemd/system/
+#                  sudo systemctl daemon-reload
+#                  sudo systemctl enable --now slack2discord
+#
+# Your edited slack2discord.service is gitignored so local paths stay out of git.
+
+[Unit]
+Description=slack2discord bridge (Slack -> Discord via Socket Mode)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The Linux user that owns the checkout.
+User=ubuntu
+# Absolute path to the project directory (must contain dist/ and .env).
+WorkingDirectory=/home/ubuntu/slack2discord
+# Use an absolute node path if node is not on the unit's default PATH (`which node`).
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=5
+# SIGTERM lets the bridge drain in-flight messages before exiting.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=slack2discord
+
+[Install]
+WantedBy=multi-user.target

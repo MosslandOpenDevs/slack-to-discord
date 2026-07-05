@@ -114,7 +114,7 @@ export interface TransformContext {
   channelName: string;
   /** Resolved sender display name */
   userName: string;
-  /** Slack mrkdwn text converted to Discord markdown (from event.text fallback) */
+  /** Message body as Discord markdown — mrkdwn text, or Block Kit rendered when text is absent, with mentions resolved */
   text: string;
   /** Default Discord payload built by the bridge — modify or replace as needed */
   payload: DiscordPayload;

@@ -1,26 +1,31 @@
 /**
- * test.ts — Offline transform tester
+ * preview.ts — Offline transform preview
  *
- * Fetches the last N messages from a Slack channel, runs them through
- * the transform pipeline, and writes results to test.log.
- * Nothing is sent to Discord.
+ * Fetches the last N messages from a Slack channel, runs them through the exact
+ * same payload builder + transform pipeline the live bridge uses, and writes the
+ * results to preview.log. Nothing is sent to Discord.
+ *
+ * Because it shares buildDefaultPayload() with index.ts, the payload you preview
+ * here (embeds, attachments, file links) matches what production would send.
+ * Inline <@user>/<#channel> mentions are not resolved offline.
  *
  * Usage:
- *   npx ts-node src/test.ts
- *   npx ts-node src/test.ts 5   ← fetch last 5 messages
+ *   npm run build && node dist/preview.js      # today's messages
+ *   node dist/preview.js 20                     # last 20 messages
  */
 
 import "dotenv/config";
 import { WebClient } from "@slack/web-api";
-import { transform } from "./transform.js";
-import { convertMarkdown } from "./convert.js";
-import type { SlackMessageEvent, DiscordPayload } from "./types.js";
+import { transform } from "./transform";
+import { messageBody } from "./convert";
+import { buildDefaultPayload } from "./payload";
+import type { SlackMessageEvent } from "./types";
 import * as fs from "fs";
 
 const SLACK_BOT_TOKEN = process.env.SLACK_BOT_TOKEN!;
 const CHANNEL_ID = (process.env.SLACK_CHANNEL_ALLOWLIST ?? "").split(",")[0].trim();
 const FETCH_COUNT = parseInt(process.argv[2] ?? "100", 10);
-const LOG_FILE = "test.log";
+const LOG_FILE = "preview.log";
 
 // Today's midnight in KST (UTC+9)
 const KST_OFFSET = 9 * 60 * 60 * 1000;
@@ -32,7 +37,6 @@ if (!SLACK_BOT_TOKEN) { console.error("SLACK_BOT_TOKEN missing"); process.exit(1
 if (!CHANNEL_ID)       { console.error("SLACK_CHANNEL_ALLOWLIST missing"); process.exit(1); }
 
 const webClient = new WebClient(SLACK_BOT_TOKEN);
-
 
 async function getDisplayName(userId?: string): Promise<string> {
   if (!userId) return "Unknown";
@@ -78,17 +82,10 @@ async function main() {
 
   for (const event of messages) {
     const userName = await getDisplayName(event.user);
-    const convertedText = convertMarkdown(event.text ?? "");
-    const defaultPayload: DiscordPayload = {
-      username: "slack2discord",
-      embeds: convertedText ? [{
-        description: convertedText,
-        color: 0x4a154b,
-        footer: { text: `#${channelName}` },
-      }] : [],
-    };
+    const bodyText = messageBody(event);
+    const defaultPayload = buildDefaultPayload({ event, userName, channelName, bodyText });
 
-    const result = transform({ event, channelName, userName, text: convertedText, payload: defaultPayload });
+    const result = transform({ event, channelName, userName, text: bodyText, payload: defaultPayload });
 
     if (result === null) {
       dropped++;

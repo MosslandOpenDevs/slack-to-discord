@@ -8,7 +8,7 @@
  *   text (bold/italic/strike/code), link, emoji, user, channel, broadcast
  */
 
-import type { SlackBlock, SlackRichTextElement, SlackRichTextLeaf, SlackTextObject } from "./types.js";
+import type { SlackBlock, SlackRichTextElement, SlackRichTextLeaf, SlackTextObject } from "./types";
 
 // ── Public entry point ────────────────────────────────────────
 
