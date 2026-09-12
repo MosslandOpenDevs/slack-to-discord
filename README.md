@@ -1,5 +1,9 @@
 # slack2discord
 
+<!-- opendevs-badges:start -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-64748b?style=flat)](LICENSE)
+<!-- opendevs-badges:end -->
+
 A bridge service that forwards Slack channel messages to Discord in real time via webhook.
 
 - Uses Slack **Socket Mode** — no public server URL required
